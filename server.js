@@ -28,17 +28,32 @@ redisClient.connect().then(() => console.log("Redis connecté"));
 
 const SECRET_KEY = "secret123";
 
-// Middleware auth
 async function verifyToken(req, res, next) {
-  const token = req.headers['authorization'];
-  if (!token) return res.status(403).send('Token requis');
+  let token = req.headers['authorization'];
+  
+  if (!token) {
+    return res.status(403).send('Token requis');
+  }
+
+  // Nettoyage du token
+  token = token.replace('Bearer ', '').trim(); //  TRIM = retire les \n, espaces, etc.
+
+  console.log("🔐 Token reçu :", token);
 
   try {
     const decoded = jwt.verify(token, SECRET_KEY);
+    console.log("Token décodé :", decoded);
+
     const stored = await redisClient.get(decoded.id);
-    if (!stored) return res.status(403).send('Token expiré');
+    console.log(" Token en cache Redis :", stored);
+
+    if (!stored || stored !== token) {
+      return res.status(403).send('Token expiré ou modifié');
+    }
+
     next();
   } catch (err) {
+    console.error(" Erreur JWT :", err.message);
     res.status(403).send('Token invalide');
   }
 }
