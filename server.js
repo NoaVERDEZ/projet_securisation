@@ -1,110 +1,143 @@
 const express = require('express');
-const cors = require('cors');
-const jwt = require("jsonwebtoken");
-const mysql = require("mysql");
-const cookieParser = require("cookie-parser");
-
+const mysql = require('mysql');
+const bodyParser = require('body-parser');
+const redis = require('redis');
+const jwt = require('jsonwebtoken');
 const app = express();
-const port = 3003;
+const port = 3005;
 
-app.use(cors({
-    origin: 'http://192.168.64.104',  // adapte selon ton frontend
-    credentials: true
-}));
-app.use(express.json());
-app.use(cookieParser());
+// Middleware
+app.use(bodyParser.json());
 
+// MySQL connection
 const db = mysql.createConnection({
-    host: '192.168.64.104',
-    user: 'site',
-    password: 'site',
-    database: 'projet_fin_annee'
+  host: '192.168.64.104',
+  user: 'site',
+  password: 'site',
+  database: 'projet_fin_annee'
 });
 
-db.connect(err => {
-    if (err) {
-        console.error('❌ Erreur de connexion à la base de données:', err);
-        process.exit(1);
-    }
-    console.log('✅ Connecté à la base de données MySQL');
+db.connect((err) => {
+  if (err) throw err;
+  console.log('Connecté à la base MySQL');
 });
 
-const config = {
-    jwtKey: 'VOTRE_CLE_JWT_SECRETE'
-};
+// Redis client
+const redisClient = redis.createClient();
+redisClient.connect().then(() => console.log("Redis connecté"));
 
-// Route login (à garder si tu en as besoin)
-app.post('/login', (req, res) => {
-    const { user, password } = req.body;
+const SECRET_KEY = "secret123";
 
-    if (!user || !password) {
-        return res.status(400).json({ message: "Le nom d'utilisateur et le mot de passe sont requis." });
-    }
+// Middleware auth
+async function verifyToken(req, res, next) {
+  const token = req.headers['authorization'];
+  if (!token) return res.status(403).send('Token requis');
 
-    const sql = 'SELECT * FROM user WHERE user = ?';
-    db.query(sql, [user], (err, results) => {
-        if (err) return res.status(500).json({ message: "Erreur serveur" });
+  try {
+    const decoded = jwt.verify(token, SECRET_KEY);
+    const stored = await redisClient.get(decoded.id);
+    if (!stored) return res.status(403).send('Token expiré');
+    next();
+  } catch (err) {
+    res.status(403).send('Token invalide');
+  }
+}
 
-        if (results.length === 0 || results[0].password !== password) {
-            return res.status(401).json({ message: "Identifiants invalides" });
-        }
+// Authentification simple (admin)
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (username === 'admin' && password === 'admin') {
+    const token = jwt.sign({ id: username }, SECRET_KEY, { expiresIn: '1h' });
+    await redisClient.set(username, token);
+    res.json({ token });
+  } else {
+    res.status(401).send('Identifiants invalides');
+  }
+});
 
-        const token = jwt.sign({ user: results[0].user }, config.jwtKey, { expiresIn: '12h' });
+// CRUD Utilisateurs
+app.get('/utilisateurs', verifyToken, (req, res) => {
+  db.query('SELECT * FROM Utilisateur', (err, results) => {
+    if (err) res.status(500).json(err);
+    else res.json(results);
+  });
+});
 
-        res.cookie('userToken', token, {
-            httpOnly: true,
-            secure: false,
-            sameSite: 'Lax',
-            maxAge: 12 * 60 * 60 * 1000
-        });
+app.get('/utilisateurs/:id', verifyToken, (req, res) => {
+  db.query('SELECT * FROM Utilisateur WHERE id = ?', [req.params.id], (err, results) => {
+    if (err) res.status(500).json(err);
+    else res.json(results[0]);
+  });
+});
 
-        return res.status(200).json({ message: 'Connexion réussie', token });
+app.post('/utilisateurs', verifyToken, (req, res) => {
+  const { nom, prenom, id_rfid, is_prof } = req.body;
+  db.query('INSERT INTO Utilisateur (nom, prenom, id_rfid, is_prof) VALUES (?, ?, ?, ?)',
+    [nom, prenom, id_rfid, is_prof], (err) => {
+      if (err) res.status(500).json(err);
+      else res.json({ message: 'Utilisateur créé' });
     });
 });
 
-// Route sauvegarde emploi du temps
-app.post('/save-schedule', (req, res) => {
-    const schedule = req.body;
-
-    const jours = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi'];
-    const heures = [
-        "08:00", "08:55", "09:50", "10:10", "11:05", "12:00",
-        "12:50", "13:45", "14:40", "15:35", "15:55", "16:50", "17:45"
-    ];
-
-    // Construction des promesses pour chaque mise à jour
-    const queries = Object.entries(schedule).map(([key, value]) => {
-        const [row, col] = key.split("-").map(Number);
-        const heure = heures[row];
-        const jour = jours[col];  // Attention ici : dans ton tableau, la colonne 0 = Lundi, donc pas -1
-
-        if (!heure || !jour) return Promise.resolve(); // Ignore si hors tableau
-
-        return new Promise((resolve, reject) => {
-            const status = value === "Cours" ? 1 : 0;
-            const sql = "UPDATE PlagesHoraires SET cours = ? WHERE jour = ? AND heure = ?";
-            db.query(sql, [status, jour, heure], (err, result) => {
-                if (err) return reject(err);
-                resolve(result);
-            });
-        });
+app.put('/utilisateurs/:id', verifyToken, (req, res) => {
+  const { nom, prenom, id_rfid, is_prof } = req.body;
+  db.query('UPDATE Utilisateur SET nom=?, prenom=?, id_rfid=?, is_prof=? WHERE id=?',
+    [nom, prenom, id_rfid, is_prof, req.params.id], (err) => {
+      if (err) res.status(500).json(err);
+      else res.json({ message: 'Utilisateur modifié' });
     });
-
-    Promise.all(queries)
-        .then(() => res.status(200).json({ message: "Sauvegarde réussie." }))
-        .catch(error => {
-            console.error("❌ Erreur MySQL :", error);
-            res.status(500).json({ message: "Erreur de sauvegarde côté serveur." });
-        });
 });
 
-// Déconnexion (optionnel)
-app.post('/logout', (req, res) => {
-    res.clearCookie('userToken');
-    res.status(200).json({ message: 'Déconnecté' });
+app.delete('/utilisateurs/:id', verifyToken, (req, res) => {
+  db.query('DELETE FROM Utilisateur WHERE id = ?', [req.params.id], (err) => {
+    if (err) res.status(500).json(err);
+    else res.json({ message: 'Utilisateur supprimé' });
+  });
 });
 
+// CRUD Plages Horaires
+app.get('/plages', verifyToken, (req, res) => {
+  db.query('SELECT * FROM PlagesHoraires', (err, results) => {
+    if (err) res.status(500).json(err);
+    else res.json(results);
+  });
+});
+
+app.get('/plages/:jour/:heure', verifyToken, (req, res) => {
+  db.query('SELECT * FROM PlagesHoraires WHERE jour = ? AND heure = ?',
+    [req.params.jour, req.params.heure], (err, results) => {
+      if (err) res.status(500).json(err);
+      else res.json(results[0]);
+    });
+});
+
+app.post('/plages', verifyToken, (req, res) => {
+  const { jour, heure, cours } = req.body;
+  db.query('INSERT INTO PlagesHoraires (jour, heure, cours) VALUES (?, ?, ?)',
+    [jour, heure, cours], (err) => {
+      if (err) res.status(500).json(err);
+      else res.json({ message: 'Plage horaire ajoutée' });
+    });
+});
+
+app.put('/plages/:jour/:heure', verifyToken, (req, res) => {
+  const { cours } = req.body;
+  db.query('UPDATE PlagesHoraires SET cours = ? WHERE jour = ? AND heure = ?',
+    [cours, req.params.jour, req.params.heure], (err) => {
+      if (err) res.status(500).json(err);
+      else res.json({ message: 'Plage horaire modifiée' });
+    });
+});
+
+app.delete('/plages/:jour/:heure', verifyToken, (req, res) => {
+  db.query('DELETE FROM PlagesHoraires WHERE jour = ? AND heure = ?',
+    [req.params.jour, req.params.heure], (err) => {
+      if (err) res.status(500).json(err);
+      else res.json({ message: 'Plage horaire supprimée' });
+    });
+});
+
+// Lancer le serveur
 app.listen(port, () => {
-    console.log(`🚀 Serveur démarré sur http://192.168.64.104:${port}`);
+  console.log(`Serveur API lancé sur http://localhost:${port}`);
 });
-// COMMIT
